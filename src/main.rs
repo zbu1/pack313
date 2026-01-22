@@ -1,10 +1,12 @@
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use walkdir::WalkDir;
 use zip::write::FileOptions;
+
+use chrono;
 
 /// Simple packer for 313-style C++ projects.
 ///
@@ -14,25 +16,41 @@ use zip::write::FileOptions;
 /// - *.h
 /// - *.vc*proj* (e.g. .vcxproj, .vcxproj.filters)
 ///
-/// By default, it writes the zip into the current working directory
-/// and *excludes* pch.cpp / pch.h unless --include-pch is passed.
+/// By default, it writes the zip into the current working directory.
 #[derive(Parser, Debug)]
 #[command(name = "pack313")]
 #[command(version)]
-#[command(about = "Create a filtered zip of a C++/VS solution tree", long_about = None)]
+#[command(
+    about = "Create a filtered zip archive of a C++/Visual Studio solution tree",
+    long_about = "Pack313 creates a filtered zip archive from a C++ project directory, including only \
+                  source files and Visual Studio project files. It recursively scans the input directory \
+                  and includes solution files (.sln), C++ source files (.cpp), header files (.h), and \
+                  Visual Studio project files (.vcxproj, .vcxproj.filters, etc.). The tool creates both \
+                  a folder copy and a zip archive with preserved file timestamps. All matching files are \
+                  included."
+)]
 struct Cli {
-    /// Root folder to scan
+    /// Root directory to scan for C++ project files
     input: PathBuf,
 
-    /// Output zip path (defaults to <cwd>/<foldername>_alexanderbui_submission.zip)
+    /// Output path for the zip archive or folder
+    ///
+    /// If the path ends with .zip, it's treated as the zip file path and the folder name is derived from it.
+    /// Otherwise, it's treated as the folder path and a .zip file is created alongside it.
+    /// If not specified, defaults to <cwd>/<foldername>_submission/ and <cwd>/<foldername>_submission.zip
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Include pch.cpp and pch.h (default: false)
-    #[arg(long, default_value_t = false)]
-    include_pch: bool,
+    /// Base name for output folder and zip file
+    ///
+    /// Overrides the default naming scheme. The output will be <name>/ and <name>.zip
+    /// in the current working directory (unless --output is specified).
+    #[arg(short = 'n', long = "name")]
+    output_name: Option<String>,
 
-    /// Suppress output about included files
+    /// Suppress verbose output about files being added to the archive
+    ///
+    /// When enabled, only the final summary and output paths are printed.
     #[arg(short, long, default_value_t = false)]
     quiet: bool,
 }
@@ -48,30 +66,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("input path is not a directory: {:?}", input).into());
     }
 
-    let output = cli.output.unwrap_or_else(|| {
-        let folder_name = input
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("pack313");
-        let zip_name = format!("{}_alexanderbui_submission.zip", folder_name);
-        std::env::current_dir().unwrap().join(zip_name)
-    });
+    let folder_name = input
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("pack313");
+    let base_name = cli.output_name.unwrap_or_else(|| format!("{}_submission", folder_name));
 
-    let output = if output.is_absolute() {
-        output
+    let (output_folder, output_zip) = if let Some(output) = cli.output {
+        let output = if output.is_absolute() {
+            output
+        } else {
+            std::env::current_dir()?.join(output)
+        };
+        
+        // If output has .zip extension, use it for zip and derive folder name
+        // Otherwise, treat it as folder name
+        if output.extension().and_then(|e| e.to_str()) == Some("zip") {
+            let folder_name = output.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&base_name);
+            let folder_path = output.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(folder_name);
+            (folder_path, output)
+        } else {
+            let zip_path = output.with_extension("zip");
+            (output, zip_path)
+        }
     } else {
-        std::env::current_dir()?.join(output)
+        let cwd = std::env::current_dir()?;
+        (cwd.join(&base_name), cwd.join(format!("{}.zip", base_name)))
     };
 
-    // Create parent dirs if needed.
-    if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent)?;
+    // Create output folder
+    if output_folder.exists() {
+        fs::remove_dir_all(&output_folder)?;
+    }
+    fs::create_dir_all(&output_folder)?;
+
+    // Create parent dirs for zip if needed
+    if let Some(parent) = output_zip.parent() {
+        fs::create_dir_all(parent)?;
     }
 
-    let file = File::create(&output)?;
-    let mut zip = zip::ZipWriter::new(file);
+    let zip_file = File::create(&output_zip)?;
+    let mut zip = zip::ZipWriter::new(zip_file);
 
-    let options: FileOptions<'_, ()> = FileOptions::default()
+    let base_options: FileOptions<'_, ()> = FileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated)
         .unix_permissions(0o644);
 
@@ -84,7 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        if !should_include(path, cli.include_pch) {
+        if !should_include(path) {
             continue;
         }
 
@@ -97,8 +138,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             writeln!(io::stderr(), "Adding: {}", rel_str.replace('\\', "/"))?;
         }
 
-        zip.start_file(rel_str.replace('\\', "/"), options)?;
+        // Copy to output folder
+        let dest_path = output_folder.join(rel_path);
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(path, &dest_path)?;
 
+        // Get file metadata for timestamp preservation
+        let metadata = fs::metadata(path)?;
+        let modified_time = metadata.modified()?;
+        let zip_datetime: zip::DateTime = chrono::DateTime::<chrono::Local>::from(modified_time)
+            .naive_local()
+            .try_into()
+            .map_err(|_| "Time out of range for zip format")?;
+
+        // Add to zip with preserved timestamp
+        let options = base_options.last_modified_time(zip_datetime);
+        zip.start_file(rel_str.replace('\\', "/"), options)?;
         buffer.clear();
         std::io::copy(&mut File::open(path)?, &mut buffer_writer(&mut buffer))?;
         zip.write_all(&buffer)?;
@@ -110,7 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !cli.quiet {
         writeln!(
             io::stderr(),
-            "Added {} file{} to zip",
+            "Added {} file{}",
             file_count,
             if file_count == 1 { "" } else { "s" }
         )?;
@@ -118,22 +175,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     writeln!(
         io::stderr(),
+        "Created folder at {}",
+        output_folder.to_string_lossy()
+    )?;
+    writeln!(
+        io::stderr(),
         "Created zip at {}",
-        output.to_string_lossy()
+        output_zip.to_string_lossy()
     )?;
 
     Ok(())
 }
 
-fn should_include(path: &Path, include_pch: bool) -> bool {
+fn should_include(path: &Path) -> bool {
     let file_name = match path.file_name().and_then(|s| s.to_str()) {
         Some(name) => name,
         None => return false,
     };
-
-    if !include_pch && (file_name.eq_ignore_ascii_case("pch.cpp") || file_name.eq_ignore_ascii_case("pch.h")) {
-        return false;
-    }
 
     let ext = path
         .extension()
