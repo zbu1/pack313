@@ -101,6 +101,7 @@ struct AppState {
     done: bool,
     list_state: ListState,
     auto_scroll: bool,
+    spinner_frame: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -247,6 +248,7 @@ fn run_ui(
         done: false,
         list_state: ListState::default(),
         auto_scroll: true,
+        spinner_frame: 0,
     };
 
     loop {
@@ -275,6 +277,9 @@ fn run_ui(
                 app_state.list_state.select(Some(app_state.logs.len() - 1));
             }
         }
+
+        // Update spinner animation
+        app_state.spinner_frame = (app_state.spinner_frame + 1) % 4;
 
         // Render UI
         terminal.draw(|f| ui(f, &mut app_state))?;
@@ -370,10 +375,20 @@ fn ui(f: &mut Frame, app_state: &mut AppState) {
         .map(|log| ListItem::new(log.clone()))
         .collect();
 
+    // Animated spinner characters
+    let spinner_chars = ['⠋', '⠙', '⠹', '⠸'];
+    let spinner = if !app_state.done {
+        format!(" {} ", spinner_chars[app_state.spinner_frame])
+    } else {
+        " ✓ ".to_string()
+    };
+
+    let title = format!("{}Progress (↑↓ to scroll)", spinner);
+
     let logs = List::new(log_items)
         .block(Block::default()
             .borders(Borders::ALL)
-            .title("Progress (↑↓ to scroll)")
+            .title(title)
             .style(Style::default().fg(Color::Cyan)))
         .highlight_style(Style::default().fg(Color::Yellow));
 
