@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use crossterm::{
-    event::{self, Event},
+    event::{self, Event, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -17,7 +17,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
     text::Text,
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
 use walkdir::WalkDir;
@@ -26,8 +26,9 @@ use tui_banner::{Banner, Style as BannerStyle, Align};
 
 use chrono;
 
-// Embed audio file at compile time
-static AUDIO_DATA: &[u8] = include_bytes!("../audio.mp3");
+// Embed audio files at compile time
+static AUDIO_DATA: &[u8] = include_bytes!("../audio1.mp3");
+static AUDIO_SLOW_DATA: &[u8] = include_bytes!("../audio_slow.mp3");
 
 /// Simple packer for 313-style C++ projects.
 ///
@@ -74,6 +75,18 @@ struct Cli {
     /// When enabled, only the final summary and output paths are printed.
     #[arg(short, long, default_value_t = false)]
     quiet: bool,
+
+    /// Add delays during file processing for demonstration/testing
+    ///
+    /// When enabled, adds a small delay when processing each file.
+    #[arg(long, default_value_t = false)]
+    slow: bool,
+
+    /// Add extra long delays during file processing for demonstration/testing
+    ///
+    /// When enabled, adds a 10-second delay when processing each file.
+    #[arg(long, default_value_t = false)]
+    extra_slow: bool,
 }
 
 enum UiMessage {
@@ -86,13 +99,15 @@ struct AppState {
     logs: Vec<String>,
     banner_frames: Arc<Mutex<Vec<String>>>,
     done: bool,
+    list_state: ListState,
+    auto_scroll: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    // Start audio playback in background
-    play_audio_background();
+    // Start audio playback in background (with appropriate audio for mode)
+    play_audio_background(cli.extra_slow);
 
     // Setup terminal
     enable_raw_mode()?;
@@ -132,22 +147,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
-fn play_audio_background() {
-    thread::spawn(|| {
-        if let Err(_e) = play_audio() {
+fn play_audio_background(use_slow_audio: bool) {
+    thread::spawn(move || {
+        if let Err(_e) = play_audio(use_slow_audio) {
             // Silently fail if audio can't be played
         }
     });
 }
 
-fn play_audio() -> Result<(), Box<dyn std::error::Error>> {
+fn play_audio(use_slow_audio: bool) -> Result<(), Box<dyn std::error::Error>> {
     use rodio::{Decoder, OutputStream, Sink};
 
     let (_stream, stream_handle) = OutputStream::try_default()?;
     let sink = Sink::try_new(&stream_handle)?;
 
-    // Use embedded audio data
-    let cursor = Cursor::new(AUDIO_DATA);
+    // Use appropriate embedded audio data
+    let audio_data = if use_slow_audio {
+        AUDIO_SLOW_DATA
+    } else {
+        AUDIO_DATA
+    };
+    let cursor = Cursor::new(audio_data);
     let source = Decoder::new(cursor)?;
 
     sink.append(source);
@@ -157,26 +177,63 @@ fn play_audio() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn generate_static_banner() -> String {
-    Banner::new("Pack 313")
+    Banner::new(">Pack 313")
         .ok()
-        .map(|b| b.style(BannerStyle::NeonCyber).align(Align::Center).render())
-        .unwrap_or_else(|| "Pack 313".to_string())
+        .map(|b| b.style(BannerStyle::FireWarning).align(Align::Center).render())
+        .unwrap_or_else(|| ">Pack 313".to_string())
 }
 
 fn animate_banner(frames: Arc<Mutex<Vec<String>>>) {
-    // Generate banner frames
-    // Since animate_wave is blocking, we'll use static banner with potential future frame cycling
-    let base_frame = generate_static_banner();
+    // Generate multiple banner frames for wave animation
+    let banner_frames = generate_wave_frames();
+    let mut frame_index = 0;
 
     loop {
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(150));
 
         if let Ok(mut frames_guard) = frames.lock() {
-            // Update with the banner frame
-            // Future: could generate multiple frames for wave effect
-            *frames_guard = vec![base_frame.clone()];
+            *frames_guard = vec![banner_frames[frame_index].clone()];
+            frame_index = (frame_index + 1) % banner_frames.len();
         }
     }
+}
+
+fn generate_wave_frames() -> Vec<String> {
+    // Generate multiple frames with wave effect
+    // We'll create frames by adding vertical offsets to simulate wave
+    let base_banner = Banner::new(">Pack 313")
+        .ok()
+        .map(|b| b.style(BannerStyle::FireWarning).align(Align::Center).render())
+        .unwrap_or_else(|| ">pack313".to_string());
+
+    let mut wave_frames = Vec::new();
+
+    // Create 8 frames with wave pattern
+    for phase in 0..8 {
+        let mut frame = String::new();
+
+        // Add wave offset (varying blank lines at top)
+        let offset = match phase {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 1,
+            4 => 0,
+            5 => 1,
+            6 => 2,
+            7 => 1,
+            _ => 0,
+        };
+
+        for _ in 0..offset {
+            frame.push('\n');
+        }
+
+        frame.push_str(&base_banner);
+        wave_frames.push(frame);
+    }
+
+    wave_frames
 }
 
 fn run_ui(
@@ -188,6 +245,8 @@ fn run_ui(
         logs: vec!["Starting pack313...".to_string()],
         banner_frames,
         done: false,
+        list_state: ListState::default(),
+        auto_scroll: true,
     };
 
     loop {
@@ -202,14 +261,18 @@ fn run_ui(
                         file_count, if file_count == 1 { "" } else { "s" }));
                     app_state.logs.push(format!("Created folder at {}", folder));
                     app_state.logs.push(format!("Created zip at {}", zip));
-                    app_state.logs.push("\nPress any key to exit...".to_string());
+                    app_state.logs.push("\nPress Enter to exit...".to_string());
                     app_state.done = true;
                 }
                 UiMessage::Error(err) => {
                     app_state.logs.push(format!("ERROR: {}", err));
-                    app_state.logs.push("\nPress any key to exit...".to_string());
+                    app_state.logs.push("\nPress Enter to exit...".to_string());
                     app_state.done = true;
                 }
+            }
+            // Auto-scroll to bottom when new message arrives
+            if app_state.auto_scroll && !app_state.logs.is_empty() {
+                app_state.list_state.select(Some(app_state.logs.len() - 1));
             }
         }
 
@@ -218,10 +281,56 @@ fn run_ui(
 
         // Handle input
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(_) = event::read()? {
-                // If done, exit on any keypress
-                if app_state.done {
+            if let Event::Key(key) = event::read()? {
+                // If done, exit on Enter key
+                if app_state.done && key.code == KeyCode::Enter {
                     break;
+                }
+
+                // Handle scrolling
+                match key.code {
+                    KeyCode::Up => {
+                        app_state.auto_scroll = false;
+                        let selected = app_state.list_state.selected().unwrap_or(0);
+                        if selected > 0 {
+                            app_state.list_state.select(Some(selected - 1));
+                        }
+                    }
+                    KeyCode::Down => {
+                        let selected = app_state.list_state.selected().unwrap_or(0);
+                        if selected < app_state.logs.len().saturating_sub(1) {
+                            app_state.list_state.select(Some(selected + 1));
+                            // Re-enable auto-scroll if at bottom
+                            if selected + 1 >= app_state.logs.len().saturating_sub(1) {
+                                app_state.auto_scroll = true;
+                            }
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        app_state.auto_scroll = false;
+                        let selected = app_state.list_state.selected().unwrap_or(0);
+                        app_state.list_state.select(Some(selected.saturating_sub(10)));
+                    }
+                    KeyCode::PageDown => {
+                        let selected = app_state.list_state.selected().unwrap_or(0);
+                        let new_pos = (selected + 10).min(app_state.logs.len().saturating_sub(1));
+                        app_state.list_state.select(Some(new_pos));
+                        // Re-enable auto-scroll if at bottom
+                        if new_pos >= app_state.logs.len().saturating_sub(1) {
+                            app_state.auto_scroll = true;
+                        }
+                    }
+                    KeyCode::Home => {
+                        app_state.auto_scroll = false;
+                        app_state.list_state.select(Some(0));
+                    }
+                    KeyCode::End => {
+                        app_state.auto_scroll = true;
+                        if !app_state.logs.is_empty() {
+                            app_state.list_state.select(Some(app_state.logs.len() - 1));
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -254,22 +363,21 @@ fn ui(f: &mut Frame, app_state: &mut AppState) {
         .block(Block::default().borders(Borders::NONE));
     f.render_widget(banner, chunks[0]);
 
-    // Render logs
+    // Render logs with scrolling
     let log_items: Vec<ListItem> = app_state
         .logs
         .iter()
-        .rev()
-        .take(chunks[1].height as usize - 2)
-        .rev()
         .map(|log| ListItem::new(log.clone()))
         .collect();
 
     let logs = List::new(log_items)
         .block(Block::default()
             .borders(Borders::ALL)
-            .title("Progress")
-            .style(Style::default().fg(Color::Cyan)));
-    f.render_widget(logs, chunks[1]);
+            .title("Progress (↑↓ to scroll)")
+            .style(Style::default().fg(Color::Cyan)))
+        .highlight_style(Style::default().fg(Color::Yellow));
+
+    f.render_stateful_widget(logs, chunks[1], &mut app_state.list_state);
 }
 
 fn process_files(cli: Cli, tx: Sender<UiMessage>) -> Result<(), Box<dyn std::error::Error>> {
@@ -373,6 +481,13 @@ fn process_files(cli: Cli, tx: Sender<UiMessage>) -> Result<(), Box<dyn std::err
         std::io::copy(&mut File::open(path)?, &mut buffer_writer(&mut buffer))?;
         zip.write_all(&buffer)?;
         file_count += 1;
+
+        // Add delay if slow mode enabled
+        if cli.extra_slow {
+            thread::sleep(Duration::from_millis(10000));
+        } else if cli.slow {
+            thread::sleep(Duration::from_millis(1000));
+        }
     }
 
     zip.finish()?;
