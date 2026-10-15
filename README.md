@@ -16,7 +16,7 @@ The tool creates both a folder copy and a zip archive with preserved file timest
 
 ### Using GitHub Release
 
-Download the latest `pack313.exe` from the [Releases](https://github.com/zanbowie138/pack313/releases) page and place it in your PATH.
+Download the latest `pack313.exe` from the [Releases](https://github.com/zbu1/pack313/releases) page and place it in your PATH.
 
 ### Build from Source
 
